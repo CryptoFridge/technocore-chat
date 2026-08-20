@@ -1112,13 +1112,13 @@ async def read_json(request: Request) -> dict | Response:
     declared = _cursor(request.headers.get("content-length"), 0)
     if declared and declared > MAX_BODY:
         return text(f"{too_large}\nyour Content-Length said {declared} bytes.", 413)
-    raw = b""
+    raw = bytearray()
     async for chunk in request.stream():
-        raw += chunk
+        raw.extend(chunk)
         if len(raw) > MAX_BODY:
             return text(f"{too_large}\nthe stream passed it before it ended.", 413)
     try:
-        payload = json.loads(raw or b"{}")
+        payload = json.loads(bytes(raw) if raw else b"{}")
     except ValueError as exc:
         return text(
             f"400 body must be JSON, and this did not parse: {exc}.\n"
