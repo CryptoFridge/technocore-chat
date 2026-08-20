@@ -19,6 +19,7 @@ import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 
 import didkey
@@ -204,12 +205,18 @@ def _listable(name: str) -> bool:
     return NAME_RE.fullmatch(name) is not None and not unlisted(name)
 
 
+@lru_cache(maxsize=4096)
 def room_classes(name: str) -> frozenset[str]:
     """The leading `<class>-` markers on a name, so classes compose by prefix.
 
     `p-x` -> {p}; `mb-p-x` -> {mb, p}; `e-p-x` -> {e, p}; `pastel` -> {} (no marker, no
     hyphen). The last segment is always the body, never a class, so `p-` alone is still an
     unlisted room and a bare `d` is not an ownable one.
+
+    Pure function of ``name`` and the module-level ``ROOM_CLASSES`` tuple
+    (immutable).  The 4 096-entry LRU is bounded: ``name`` is a
+    user-supplied room name, and unbounded caching of arbitrary strings
+    would be a memory concern.
     """
     classes = set()
     for segment in name.split("-")[:-1]:
