@@ -435,6 +435,10 @@ def _accept_ranges(accept: str) -> list[tuple[str, float]]:
     for part in accept.lower().split(","):
         name, _, params = part.strip().partition(";")
         q = 1.0
+        # partition(';') consumed the first separator; no further semicolons
+        # remain in `params`, so this is a single-pass extraction of the q
+        # value.  A future RFC extension could add more parameters here;
+        # the loop makes that a non-event rather than a refactor.
         for param in params.split(";"):
             key, _, value = param.partition("=")
             if key.strip() == "q":

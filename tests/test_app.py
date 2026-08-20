@@ -2886,3 +2886,253 @@ def test_the_ai_catalog_lists_only_artifacts_that_resolve(client):
         assert entry["identifier"] and entry["type"] and entry["url"]
         path = entry["url"].split("testserver", 1)[-1] or "/"
         assert client.get(path).status_code == 200, f"{entry['identifier']} -> {path}"
+
+
+# ------------------------------------------------------------------ POST-body refund policy
+#
+# A 400 (malformed JSON or wrong shape) refunds the write token: parsing a small
+# invalid body is cheap, and this is usually an honest client bug.  A 413 (body
+# over MAX_BODY) does NOT refund: the server already paid to stream that body,
+# and refunding would let a client hammer oversized uploads at zero rate cost.
+
+
+def test_malformed_json_on_post_refunds_the_write_token(client, monkeypatch):
+    """A typo in the POST body (bad JSON) costs nothing: the token taken by
+    take() is refunded so a botched request does not drain the write budget."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "RATE_WRITE", 3)
+    # Spend one token: 2 remain
+    client.get("/r/lobby/say/bot/m0")
+    # Bad JSON on POST: take() spends a token, read_json() returns 400, refund()
+    # puts it back -- so 2 tokens remain, not 1.
+    r = client.post("/r/lobby", content=b"not json", headers={"content-type": "application/json"})
+    assert r.status_code == 400
+    # Both remaining writes succeed: the refund restored the token
+    assert client.get("/r/lobby/say/bot/m1").status_code == 200
+    assert client.get("/r/lobby/say/bot/m2").status_code == 200
+    # A fourth would be rate-limited
+    assert client.get("/r/lobby/say/bot/m3").status_code == 429
+
+
+def test_oversized_body_on_post_does_not_refund(client, monkeypatch):
+    """An oversized POST body (413) does NOT refund: the server already paid to
+    stream that body, and refunding would let a client hammer oversized uploads
+    at zero rate cost."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "RATE_WRITE", 2)
+    # Spend one token: 1 remains
+    client.get("/r/lobby/say/bot/m0")
+    # Oversized POST: take() spends a token, read_json() returns 413, no refund
+    huge = b"x" * (app_module.MAX_BODY + 1)
+    r = client.post("/r/lobby", content=huge, headers={"content-type": "application/json"})
+    assert r.status_code == 413
+    # The last token was spent and not refunded: next write is 429
+    assert client.get("/r/lobby/say/bot/m1").status_code == 429
+
+
+def test_oversized_body_on_note_post_does_not_refund(client, monkeypatch):
+    """Same asymmetry on the note POST lane."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "RATE_WRITE", 2)
+    client.get("/r/lobby/say/bot/m0")
+    huge = b"x" * (app_module.MAX_BODY + 1)
+    r = client.post(
+        "/kv/ns/key",
+        content=huge,
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 413
+    assert client.get("/r/lobby/say/bot/m1").status_code == 429
+
+
+def test_refund_never_exceeds_bucket_capacity(client, monkeypatch):
+    """Two refunds on a bucket that is already full must not mint tokens above
+    the ceiling -- the bucket stays at cap."""
+    from typing import Any
+
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "RATE_WRITE", 4)
+    # Mock client_ip so refund() does not need a real Request
+    monkeypatch.setattr(app_module, "client_ip", lambda _req: "fixed-ip")
+    # Seed a bucket at exactly full capacity
+    app_module._buckets[("fixed-ip", "write")] = (4.0, app_module._now())
+    # Refund twice -- should clamp at cap, not go to 6.0
+    sentinel: Any = None  # client_ip is mocked, so the object identity is irrelevant
+    app_module.refund(sentinel, "write", app_module.RATE_WRITE)
+    app_module.refund(sentinel, "write", app_module.RATE_WRITE)
+    tokens, _ = app_module._buckets[("fixed-ip", "write")]
+    assert tokens == 4.0, f"refund exceeded cap: {tokens}"
+
+
+# ------------------------------------------------------------------ identities LRU
+#
+# _identities is a bounded OrderedDict LRU (mirrors _buckets).  Once full the
+# idlest entry is evicted; re-inserting an existing identity refreshes its
+# recency so active callers survive a flood of new IPs.
+
+
+def test_identities_evicts_oldest_when_full(client, monkeypatch):
+    """Fill past MAX_IDENTITIES and confirm the oldest entry is gone."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "MAX_IDENTITIES", 5)
+    monkeypatch.setattr(app_module, "CLIENT_IP_HEADER", "cf-connecting-ip")
+    # Insert 5 distinct identities
+    for i in range(5):
+        client.get("/r/lobby", headers={"cf-connecting-ip": f"10.0.0.{i}"})
+    assert len(app_module._identities) == 5
+    assert "10.0.0.0" in app_module._identities
+    # Insert a 6th: oldest (10.0.0.0) is evicted
+    client.get("/r/lobby", headers={"cf-connecting-ip": "10.0.0.5"})
+    assert len(app_module._identities) == 5
+    assert "10.0.0.0" not in app_module._identities
+    assert "10.0.0.5" in app_module._identities
+
+
+def test_identities_reseen_identity_survives_eviction(client, monkeypatch):
+    """Re-seeing an existing identity refreshes its recency, so it survives
+    a flood that evicts its neighbours."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "MAX_IDENTITIES", 4)
+    monkeypatch.setattr(app_module, "CLIENT_IP_HEADER", "cf-connecting-ip")
+    # Insert A, B, C, D
+    for nick in ("A", "B", "C", "D"):
+        client.get("/r/lobby", headers={"cf-connecting-ip": f"10.0.0.{nick}"})
+    assert len(app_module._identities) == 4
+    # Re-see B: B moves to the most-recent end
+    client.get("/r/lobby", headers={"cf-connecting-ip": "10.0.0.B"})
+    # Insert E, F: A and C should be evicted, B survives
+    for nick in ("E", "F"):
+        client.get("/r/lobby", headers={"cf-connecting-ip": f"10.0.0.{nick}"})
+    assert len(app_module._identities) == 4
+    assert "10.0.0.B" in app_module._identities, "re-seen identity was evicted"
+    assert "10.0.0.E" in app_module._identities
+    assert "10.0.0.F" in app_module._identities
+
+
+def test_identities_never_exceeds_max(client, monkeypatch):
+    """The LRU never grows past MAX_IDENTITIES, even under sustained flood."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "MAX_IDENTITIES", 8)
+    monkeypatch.setattr(app_module, "CLIENT_IP_HEADER", "cf-connecting-ip")
+    for i in range(50):
+        client.get("/r/lobby", headers={"cf-connecting-ip": f"10.0.{i // 256}.{i % 256}"})
+    assert len(app_module._identities) <= 8
+
+
+def test_identities_stats_reflects_recent_window(client, monkeypatch):
+    """distinct_identities in /stats reports the bounded window count,
+    not an all-time total."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "STATS_TOKEN", "t")
+    monkeypatch.setattr(app_module, "STATS_CACHE_SECONDS", 0)
+    monkeypatch.setattr(app_module, "MAX_IDENTITIES", 5)
+    monkeypatch.setattr(app_module, "CLIENT_IP_HEADER", "cf-connecting-ip")
+    # Insert 10 distinct IPs; the window holds at most 5
+    for i in range(10):
+        client.get("/r/lobby", headers={"cf-connecting-ip": f"10.0.{i // 256}.{i % 256}"})
+    ident = client.get("/stats", headers={"X-Stats-Token": "t"}).json()["client_identity"]
+    assert ident["distinct_identities"] == 5
+
+
+# ------------------------------------------------------------------ _accept_ranges
+# Characterisation tests for the Accept-header parser.  All cases are recorded from
+# the live behaviour before any restructure so the restructure must not change them.
+
+
+def test_accept_ranges_simple_media_type():
+    """A media type with no q defaults to 1.0."""
+    import app as app_module
+
+    assert app_module._accept_ranges("application/json") == [("application/json", 1.0)]
+
+
+def test_accept_ranges_q_value_is_parsed():
+    """Explicit q overrides the default."""
+    import app as app_module
+
+    assert app_module._accept_ranges("text/html;q=0.8") == [("text/html", 0.8)]
+
+
+def test_accept_ranges_comma_separated_types():
+    """Multiple media types are returned in order."""
+    import app as app_module
+
+    got = app_module._accept_ranges("text/html;q=0.8, application/json")
+    assert got == [("text/html", 0.8), ("application/json", 1.0)]
+
+
+def test_accept_ranges_extra_parameter_before_q():
+    """Parameters between the media type and q are skipped; q is still found."""
+    import app as app_module
+
+    got = app_module._accept_ranges("text/html;level=1;q=0.8")
+    assert got == [("text/html", 0.8)]
+
+
+def test_accept_ranges_wildcard():
+    """A bare */* gets default q."""
+    import app as app_module
+
+    assert app_module._accept_ranges("*/*") == [("*/*", 1.0)]
+
+
+def test_accept_ranges_unparseable_q_is_zero():
+    """A q that is not a number is treated as 0 (not acceptable)."""
+    import app as app_module
+
+    got = app_module._accept_ranges("text/html;q=abc")
+    assert got == [("text/html", 0.0)]
+
+
+def test_accept_ranges_empty_q_is_zero():
+    """q= (empty value) is not a float, so q=0."""
+    import app as app_module
+
+    got = app_module._accept_ranges("text/html;q=")
+    assert got == [("text/html", 0.0)]
+
+
+def test_accept_ranges_large_q():
+    """q=2.0 is parsed as 2.0 (not clamped to 1.0)."""
+    import app as app_module
+
+    assert app_module._accept_ranges("text/html;q=2.0") == [("text/html", 2.0)]
+
+
+def test_accept_ranges_whitespace_is_trimmed():
+    """Leading/trailing whitespace around name and values is stripped."""
+    import app as app_module
+
+    got = app_module._accept_ranges("  text/html ; q=0.8 ")
+    assert got == [("text/html", 0.8)]
+
+
+def test_accept_ranges_multiple_types_with_q_and_wildcard():
+    """A mix of typed and wildcard ranges."""
+    import app as app_module
+
+    got = app_module._accept_ranges("text/html;q=0.8, */*;q=0.1")
+    assert got == [("text/html", 0.8), ("*/*", 0.1)]
+
+
+def test_accept_ranges_duplicate_types_both_kept():
+    """Two entries for the same type are both returned (order matters)."""
+    import app as app_module
+
+    got = app_module._accept_ranges("text/html;q=0.8, text/html;q=0.1")
+    assert got == [("text/html", 0.8), ("text/html", 0.1)]
+
+
+def test_accept_ranges_empty_string():
+    """An empty Accept header returns no ranges."""
+    import app as app_module
+
+    assert app_module._accept_ranges("") == []
