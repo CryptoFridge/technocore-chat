@@ -214,6 +214,13 @@ either.
 The container is a bare HTTP origin by design. Run it read-only, with dropped capabilities and a
 memory limit.
 
+**Multiple workers multiply rate limits.** uvicorn's `--workers N` spawns N separate processes,
+each with its own in-memory rate-limit buckets.  A caller hitting worker 1 does not see the
+tokens spent by worker 2, so the effective per-IP budget is N× the configured value.  This is
+acceptable when a reverse proxy always routes the same client to the same worker (sticky
+sessions), but surprising otherwise.  The default is a single worker, and the Docker image
+ships that way.
+
 ## HTTP hardening
 
 Header blocks are capped at **48 headers / 8 KiB** (431 past that) in the app, because a parser cap

@@ -179,6 +179,18 @@ _now = time.monotonic
 
 # --------------------------------------------------------------------------- helpers
 
+# Thread-safety invariant
+# ~~~~~~~~~~~~~~~~~~~~~~~
+# Every module-level mutable below (_buckets, _requests, _proxy_evidence,
+# _identities, _rooms_cache, _waiters_total, _waiters_by_ip, _stats_cache)
+# is touched ONLY from the event-loop thread.  The store's blocking calls
+# run via ``run_in_threadpool`` (see room_post / note_post), and those
+# callees must never reference these globals.  uvicorn with ``--workers N``
+# spawns N *processes* (not threads), so each gets its own copy and the
+# invariant holds per-worker.  Running ``--workers > 1`` therefore
+# multiplies the effective rate limits by the worker count — document that
+# in the README if you deploy with multiple workers.
+
 # Bounded LRU, because every unseen IP would otherwise add entries forever and the
 # proxy's per-IP rule caps requests per IP, not the number of distinct IPs — a rotating
 # IPv6 /64 or a distributed flood would grow this until the 128 MiB container OOMs.
