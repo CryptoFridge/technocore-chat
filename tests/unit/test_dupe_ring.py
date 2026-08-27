@@ -204,3 +204,38 @@ def test_concurrent_writers_never_corrupt_the_ring() -> None:
     assert not errors, [repr(exc) for exc in errors[:3]]
     assert len(limit._dupes) <= cap, "the bound has to hold under concurrency too"
     limit._dupes.clear()
+
+
+def test_refused_dupe_stays_in_lru_ring_under_eviction():
+    """Issue #358: a refused duplicate must not be the first entry evicted by the hard cap.
+    Before the fix, the refusal branch returned early without calling move_to_end, leaving
+    the refused key at the front of the LRU where cap eviction drops it first."""
+    import limit
+
+    limit._dupes.clear()
+    room, phrase = "lobby", "buy the token now, huge gains guaranteed, dont miss out"
+    t = 0.0
+    # Accept the first 5 copies
+    for _ in range(5):
+        assert (
+            limit.dupe_refused(room, phrase, t, window=1000, min_length=16, max_copies=5, cap=64)
+            is False
+        )
+        t += 1.0
+    # Then keep it refused, well inside the window
+    for _ in range(20):
+        assert (
+            limit.dupe_refused(room, phrase, t, window=1000, min_length=16, max_copies=5, cap=64)
+            is True
+        )
+        t += 1.0
+    # Fill the ring with unrelated traffic
+    for i in range(64):
+        limit.dupe_refused(room, f"filler {i}", t, window=1000, min_length=16, max_copies=5, cap=64)
+        t += 1.0
+    # Still well inside the window, still the exact phrase — should still be refused
+    assert (
+        limit.dupe_refused(room, phrase, t, window=1000, min_length=16, max_copies=5, cap=64)
+        is True
+    )
+    limit._dupes.clear()
