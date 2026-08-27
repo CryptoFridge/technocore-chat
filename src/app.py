@@ -1708,16 +1708,21 @@ async def stats(request: Request) -> Response:
             "room_bytes_total": store.MAX_TOTAL_ROOM_BYTES,
         },
         # Whether "per IP" is true on this deployment. `client_ip_header` is what the
-        # limiter reads; `distinct_identities` is how many callers it has ever told apart;
-        # `proxied_requests_ignored` counts requests that arrived with a CDN's own client-IP
-        # header while we were configured to ignore it. High proxied count with
-        # distinct_identities near 1 means every caller is sharing one bucket — including
-        # the per-day room budget, which then bounds the whole world at once. Fix by
-        # pointing CHAT_CLIENT_IP_HEADER at the header your proxy overwrites (Cloudflare:
-        # cf-connecting-ip), and only once the origin is unreachable except through it.
+        # limiter reads; `distinct_identities` is the number of callers currently held in
+        # the LRU window — when the cap is reached, the oldest are evicted and new ones
+        # take their place, so the count reflects recent traffic rather than a lifetime
+        # total. `identities_capacity` is the window size, and `identities_evictions`
+        # counts how many entries have been pushed out since the process started. High
+        # proxied count with distinct_identities near 1 means every caller is sharing one
+        # bucket — including the per-day room budget, which then bounds the whole world
+        # at once. Fix by pointing CHAT_CLIENT_IP_HEADER at the header your proxy
+        # overwrites (Cloudflare: cf-connecting-ip), and only once the origin is
+        # unreachable except through it.
         "client_identity": {
             "client_ip_header": CLIENT_IP_HEADER or None,
             "distinct_identities": len(_identities),
+            "identities_capacity": limit.MAX_IDENTITIES,
+            "identities_evictions": limit._identities_evictions,
             "proxied_requests_ignored": _proxy_evidence["proxied_requests"],
         },
     }

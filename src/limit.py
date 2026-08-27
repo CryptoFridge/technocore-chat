@@ -64,8 +64,9 @@ _requests: dict[str, int] = {"read": 0, "write": 0, "rate_limited": 0}
 # and an `identities` of 1 is not rate limiting anyone individually — it is rate limiting
 # the CDN, and the room budget is being shared by the entire internet.
 _proxy_evidence: dict[str, int] = {"proxied_requests": 0}
-_identities: set[str] = set()
-MAX_IDENTITIES = 50_000  # bounded like _buckets; a counter that OOMs is not a diagnostic
+_identities: OrderedDict[str, None] = OrderedDict()
+_identities_evictions: int = 0
+MAX_IDENTITIES: int = 50_000  # bounded like _buckets; a counter that OOMs is not a diagnostic
 
 # The cross-sender duplicate ring: the write-path abuse filter. Keyed per (room, digest
 # of the NORMALISED text) with no sender anywhere in the key, because the flood it
@@ -269,8 +270,14 @@ def take(request, kind, per_min, burst=None, *, ip_header="", max_buckets=MAX_BU
     tokens, which never reaches the 1.0 a grant costs — the limit would refuse everything.
     """
     ip = client_ip(request, ip_header)
-    if len(_identities) < MAX_IDENTITIES:
-        _identities.add(ip)
+    global _identities_evictions
+    if ip in _identities:
+        _identities.move_to_end(ip)
+    else:
+        if len(_identities) >= MAX_IDENTITIES:
+            _identities.popitem(last=False)
+            _identities_evictions += 1
+        _identities[ip] = None
     now = time.monotonic()
     cap = float(per_min if burst is None else burst)
     tokens, last = _buckets.get((ip, kind), (cap, now))

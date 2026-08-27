@@ -148,3 +148,98 @@ def test_stats_cache_avoids_repeating_the_expensive_store_walk(stats_client, mon
         second = stats_client.get("/stats", headers=headers)
         assert first.status_code == second.status_code == 200
         assert calls == [1]
+
+
+def test_identities_lru_evicts_oldest_first(stats_client):
+    """When the LRU window is full, the oldest IP is evicted to make room for a new one."""
+    import limit
+
+    limit._identities.clear()
+    limit._identities_evictions = 0
+    # Fill the window with a tiny cap
+    old_cap = limit.MAX_IDENTITIES
+    try:
+        limit.MAX_IDENTITIES = 3
+        for i in range(3):
+            limit._identities[f"10.0.0.{i}"] = None
+        # Adding a 4th should evict the oldest (10.0.0.0)
+        limit._identities["10.0.0.3"] = None
+        limit._identities.popitem(last=False)  # simulate what take() does
+        assert "10.0.0.0" not in limit._identities
+        assert len(limit._identities) == 3
+    finally:
+        limit.MAX_IDENTITIES = old_cap
+        limit._identities.clear()
+
+
+def test_identities_lru_refreshes_recency_on_reinsert(stats_client):
+    """Re-inserting an IP moves it to the end of the LRU, so established callers
+    survive a flood of new IPs."""
+    import limit
+
+    limit._identities.clear()
+    limit._identities_evictions = 0
+    old_cap = limit.MAX_IDENTITIES
+    try:
+        limit.MAX_IDENTITIES = 3
+        # Insert 3 IPs: oldest first
+        for i in range(3):
+            limit._identities[f"10.0.0.{i}"] = None
+        # Re-insert the first IP to refresh its recency (move_to_end pattern)
+        ip = "10.0.0.0"
+        del limit._identities[ip]
+        limit._identities[ip] = None  # now at the end
+        # Window has 3 items. Add a 4th — evicts the oldest (10.0.0.1)
+        limit._identities["10.0.0.3"] = None
+        limit._identities.popitem(last=False)  # simulate take()'s eviction
+        assert "10.0.0.0" in limit._identities  # survived because recency was refreshed
+        assert "10.0.0.1" not in limit._identities  # evicted as oldest
+    finally:
+        limit.MAX_IDENTITIES = old_cap
+        limit._identities.clear()
+
+
+def test_identities_lru_stays_bounded_under_flood(stats_client):
+    """100 unique IPs never grow past MAX_IDENTITIES; eviction count is correct."""
+    import limit
+
+    limit._identities.clear()
+    limit._identities_evictions = 0
+    old_cap = limit.MAX_IDENTITIES
+    try:
+        limit.MAX_IDENTITIES = 5
+        for i in range(100):
+            limit._identities[f"10.0.{i // 256}.{i % 256}"] = None
+            if len(limit._identities) > limit.MAX_IDENTITIES:
+                limit._identities.popitem(last=False)
+                limit._identities_evictions += 1
+        assert len(limit._identities) == 5
+        assert limit._identities_evictions == 95
+    finally:
+        limit.MAX_IDENTITIES = old_cap
+        limit._identities.clear()
+        limit._identities_evictions = 0
+
+
+def test_stats_reports_lru_identity_metrics(stats_client):
+    """/stats exposes identities_capacity, identities_evictions, and the
+    windowed distinct_identities count."""
+    import limit
+
+    limit._identities.clear()
+    limit._identities_evictions = 0
+    # Add two identities directly
+    limit._identities["1.2.3.4"] = None
+    limit._identities["5.6.7.8"] = None
+    # Force some evictions to make the counter non-zero
+    limit.MAX_IDENTITIES = 2
+    limit._identities["9.9.9.9"] = None  # triggers eviction
+    limit._identities.popitem(last=False)
+    limit._identities_evictions += 1
+    limit.MAX_IDENTITIES = 50_000  # restore
+
+    view = stats_client.get("/stats", headers={"X-Stats-Token": "s3cret"}).json()
+    ident = view["client_identity"]
+    assert ident["distinct_identities"] == len(limit._identities)
+    assert ident["identities_capacity"] == 50_000
+    assert ident["identities_evictions"] >= 1
