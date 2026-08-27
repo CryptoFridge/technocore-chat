@@ -1135,7 +1135,11 @@ def room_say(request: Request) -> Response:
     with _dupe_slot(room, body) as refused:
         if refused:
             return _dupe_refusal(request, room)
-        rec = store.append(config.ROOT, room, nick, body)
+        try:
+            rec = store.append(config.ROOT, room, nick, body)
+        except StoreError:
+            limit._settle_room_budget(request, {}, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER)
+            raise
     config._dbg(3, "write", room=room, seq=rec["seq"], chars=len(rec["text"]))
     limit._settle_room_budget(request, rec, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER)
     view = store.read_messages(config.ROOT, room, limit=20)
@@ -1166,7 +1170,11 @@ def room_say_signed(request: Request) -> Response:
     with _dupe_slot(room, body) as refused:
         if refused:
             return _dupe_refusal(request, room)
-        rec = store.append(config.ROOT, room, "", body, did=signer, nonce=int(nonce))
+        try:
+            rec = store.append(config.ROOT, room, "", body, did=signer, nonce=int(nonce))
+        except StoreError:
+            limit._settle_room_budget(request, {}, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER)
+            raise
     config._dbg(3, "write", room=room, seq=rec["seq"], chars=len(rec["text"]))
     limit._settle_room_budget(request, rec, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER)
     view = store.read_messages(config.ROOT, room, limit=20)
@@ -1238,6 +1246,7 @@ async def room_post(request: Request) -> Response:
         return limit.limited("write", RATE_WRITE, retry, text=text, max_wait=MAX_WAIT)
     payload = await read_json(request)
     if isinstance(payload, Response):
+        limit.refund(request, "write", RATE_WRITE)
         return payload
     room = request.path_params["room"]
     credentials = _payload_credentials(payload)
@@ -1265,12 +1274,24 @@ async def room_post(request: Request) -> Response:
             with _dupe_slot(room, sent) as refused:
                 if refused:
                     return _dupe_refusal(request, room)
-                posted = store.append(config.ROOT, room, nick, sent)
+                try:
+                    posted = store.append(config.ROOT, room, nick, sent)
+                except StoreError:
+                    limit._settle_room_budget(
+                        request, {}, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER
+                    )
+                    raise
         else:
             with _dupe_slot(room, body) as refused:
                 if refused:
                     return _dupe_refusal(request, room)
-                posted = store.append(config.ROOT, room, "", body, did=signer, nonce=int(nonce))
+                try:
+                    posted = store.append(config.ROOT, room, "", body, did=signer, nonce=int(nonce))
+                except StoreError:
+                    limit._settle_room_budget(
+                        request, {}, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER
+                    )
+                    raise
         config._dbg(3, "write", room=room, seq=posted["seq"], chars=len(posted["text"]))
         limit._settle_room_budget(request, posted, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER)
         return respond(
@@ -1500,6 +1521,7 @@ async def note_post(request: Request) -> Response:
         return limit.limited("write", RATE_WRITE, retry, text=text, max_wait=MAX_WAIT)
     payload = await read_json(request)
     if isinstance(payload, Response):
+        limit.refund(request, "write", RATE_WRITE)
         return payload
     p = request.path_params
     ns, key = p["ns"], p["key"]
