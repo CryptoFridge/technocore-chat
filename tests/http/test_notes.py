@@ -396,3 +396,45 @@ def test_signed_writes_pay_the_write_budget_like_any_other(client, monkeypatch):
             _say_signed(client, "lobby", did, sign, f"m{i}", nonce=i).status_code for i in (1, 2, 3)
         ]
         assert codes == [200, 200, 429]
+
+
+def test_if_and_if_absent_conflict(client):
+    """#290: sending both if= and if_absent= must return 400, not silently pick one."""
+    resp = client.get("/kv/test/if-conflict/set/v?if=X&if_absent=1")
+    assert resp.status_code == 400
+    assert "if and if_absent" in resp.text
+
+
+def test_if_absent_wins_alone(client):
+    """#290: if_absent=1 alone still works (no regression)."""
+    resp = client.get("/kv/test/if-absent-only/set/v?if_absent=1")
+    assert resp.status_code == 200
+
+
+def test_if_alone_still_works(client):
+    """#290: if= alone still works (no regression)."""
+    # create the note first
+    client.get("/kv/test/if-alone/set/old")
+    resp = client.get("/kv/test/if-alone/set/new?if=old")
+    assert resp.status_code == 200
+
+
+def test_capacity_error_message_notes(client):
+    """#285: note capacity error should guide to /kv/<ns>, not /rooms."""
+    from store import MAX_NOTES_PER_NS, _at_capacity
+
+    err = _at_capacity(MAX_NOTES_PER_NS, "note")
+    msg = str(err)
+    # note capacity error should NOT say "GET /rooms"
+    assert "/rooms" not in msg
+    # it should mention /kv/ for listing notes
+    assert "/kv/" in msg
+
+
+def test_capacity_error_message_rooms(client):
+    """#285: room capacity error should still guide to /rooms."""
+    from store import MAX_ROOMS, _at_capacity
+
+    err = _at_capacity(MAX_ROOMS, "room")
+    msg = str(err)
+    assert "/rooms" in msg

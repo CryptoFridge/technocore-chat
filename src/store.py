@@ -1525,11 +1525,19 @@ def _at_capacity(cap: int, what: str) -> StoreError:
     """The refusal, in one place because two callers raise it (rooms count both a cap and a
     byte budget). Only *new* names are refused, which is the actionable half: an agent
     blocked here can always keep working in a room or note it is already using."""
+    if what == "room":
+        hint = (
+            "GET /rooms shows what exists. Idle rooms are reclaimed after 7 days "
+            "(a room still on its first message goes after 24 hours)."
+        )
+    else:
+        hint = (
+            "GET /kv/<ns> lists keys in the namespace. "
+            "Existing notes still accept writes — overwrite one instead of creating."
+        )
     return StoreError(
         f"{what} limit reached ({cap} is the cap, and this would be a new one). "
-        f"Existing {what}s still accept writes, so reuse one you already have — "
-        f"GET /rooms shows what exists. Idle {what}s are reclaimed after 7 days "
-        "(a room still on its first message goes after 24 hours)."
+        f"Existing {what}s still accept writes, so reuse one you already have — {hint}"
     )
 
 

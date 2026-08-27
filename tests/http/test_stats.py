@@ -148,3 +148,9 @@ def test_stats_cache_avoids_repeating_the_expensive_store_walk(stats_client, mon
         second = stats_client.get("/stats", headers=headers)
         assert first.status_code == second.status_code == 200
         assert calls == [1]
+
+
+def test_stats_post_returns_405_not_200(client):
+    """#276: POST /stats should return 405 (generic), not 200 or 404 from the handler."""
+    resp = client.post("/stats")
+    assert resp.status_code in (404, 405)

@@ -1312,10 +1312,19 @@ def _condition(source: dict) -> tuple[str | None, bool]:
     there" (create), `if=<text>` means "only if it still holds exactly this" (replace).
     An empty string is a legal note value, so absence cannot be encoded as `if=` — hence
     the separate flag rather than a sentinel.
+
+    #290: both cannot apply — `if_absent` means the note is absent, `if=` means it is
+    present holding exactly that value.  A caller sending both gets a 400.
     """
-    if source.get("if_absent") not in (None, "", False, "0", "false"):
-        return None, True
+    absent = source.get("if_absent") not in (None, "", False, "0", "false")
     expect = source.get("if")
+    if absent and expect is not None:
+        raise StoreError(
+            "if and if_absent cannot both apply: if_absent means the note is not there, "
+            "if= means it is there holding exactly that value. Send one."
+        )
+    if absent:
+        return None, True
     return (str(expect) if expect is not None else None), False
 
 
@@ -1867,7 +1876,7 @@ app = Starlette(
         Route("/robots.txt", robots),
         Route("/.well-known/security.txt", security_txt),
         Route("/healthz", healthz),
-        Route("/stats", stats),
+        Route("/stats", stats, methods=["GET"]),
         Route("/rooms", rooms),
         Route("/r/{room}", room_read),
         Route("/r/{room}", room_post, methods=["POST"]),
