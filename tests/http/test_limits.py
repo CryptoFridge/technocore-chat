@@ -909,3 +909,25 @@ def test_waiter_slots_are_bounded_per_ip(client):
                 assert other is True  # a different IP is unaffected
     assert app._waiters_total == 0  # every slot released
     assert app._waiters_by_ip == {}  # and the table does not grow per distinct IP
+
+
+def test_buckets_pop_insert_refreshes_lru_position(client, monkeypatch):
+    """Issue #378: _buckets used move_to_end which is a no-op when the key was
+    concurrently evicted.  pop-then-insert always refreshes.  Repeated access
+    from the same (ip, kind) must not create duplicate entries and must refresh
+    the LRU position."""
+    import app as app_module
+    import config
+
+    with config.override(CLIENT_IP_HEADER="cf-connecting-ip"):
+        ip = "10.0.0.1"
+        client.get("/r/lobby", headers={"cf-connecting-ip": ip})
+
+        # Second hit from the same IP — should update, not duplicate
+        client.get("/r/lobby", headers={"cf-connecting-ip": ip})
+        read_count = sum(1 for k in app_module._buckets if k[0] == ip and k[1] == "read")
+        assert read_count == 1, "pop-then-insert must not create duplicates"
+
+        # The read bucket should be at the tail (most-recently-used)
+        last_key = list(app_module._buckets.keys())[-1]
+        assert last_key == (ip, "read"), "re-used bucket should be at the LRU tail"

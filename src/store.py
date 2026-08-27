@@ -881,11 +881,14 @@ def _cached_window(root: Path, name: str, stamp: tuple) -> tuple[int, list[str]]
     key = (str(root), name)
     hit = _window_memo.get(key)
     if hit and hit[0] == stamp:
-        _window_memo.move_to_end(key)
+        # pop-then-insert, not move_to_end: same reason as _rooms_cache —
+        # move_to_end on a concurrently-evicted key raises KeyError.
+        _window_memo.pop(key, None)
+        _window_memo[key] = hit
         return hit[1]
     view = room_window(root, name)
+    _window_memo.pop(key, None)
     _window_memo[key] = (stamp, view)
-    _window_memo.move_to_end(key)
     while len(_window_memo) > _WINDOW_MEMO_MAX:
         _window_memo.popitem(last=False)
     return view

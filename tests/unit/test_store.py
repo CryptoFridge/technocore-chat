@@ -1102,3 +1102,41 @@ def test_a_json_escaped_did_is_the_one_record_the_nonce_scan_cannot_see(tmp_path
     assert rec is not None and rec["from"] == did  # legal JSON, and it parses to the DID
     assert did.encode() not in room.read_bytes()  # but not present as itself, so:
     assert store._last_nonce(tmp_path, "lobby", did) is None
+
+
+def test_window_memo_pop_insert_refreshes_on_cache_hit(tmp_path, monkeypatch):
+    """Issue #376: _window_memo used move_to_end which is a no-op when the key was
+    concurrently evicted.  pop-then-insert always refreshes.  Two calls to room_stats
+    with an unchanged room must hit the cache (no re-read) and must not duplicate the
+    memo entry for that room."""
+    import store
+
+    store._window_memo.clear()  # isolation from prior tests
+    store.append(tmp_path, "aaa", "bot", "first")
+    store.append(tmp_path, "aaa", "bot", "second")
+
+    calls = []
+    real = store.room_window
+    monkeypatch.setattr(
+        store, "room_window", lambda root, name: (calls.append(name), real(root, name))[1]
+    )
+
+    # First call populates the memo for "aaa"
+    store.room_stats(tmp_path)
+    aaa_entries = [k for k in store._window_memo if k[1] == "aaa"]
+    assert len(aaa_entries) == 1, "first call must create exactly one memo entry for aaa"
+
+    # Second call hits the cache — should refresh, not duplicate
+    calls.clear()
+    store.room_stats(tmp_path)
+    assert calls == [], "unchanged room must not be re-read"
+    aaa_entries = [k for k in store._window_memo if k[1] == "aaa"]
+    assert len(aaa_entries) == 1, "pop-then-insert must not create duplicate entries for aaa"
+
+    # A write changes the stamp — should replace, not add
+    store.append(tmp_path, "aaa", "bot", "third")
+    calls.clear()
+    store.room_stats(tmp_path)
+    assert calls == ["aaa"], "changed room must be re-read"
+    aaa_entries = [k for k in store._window_memo if k[1] == "aaa"]
+    assert len(aaa_entries) == 1, "new write should replace, not add"
