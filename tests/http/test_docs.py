@@ -617,6 +617,8 @@ def test_every_refusal_is_provoked_and_every_provoked_refusal_is_documented(clie
     cases = [
         # Reads.
         ("/r/{room}", "get", 400, lambda: client.get("/r/UPPER")),
+        ("/rooms", "get", 400, lambda: client.get("/rooms?limit=0")),
+        ("/rooms", "get", 400, lambda: client.get("/rooms?format=xml")),
         ("/kv/{ns}", "get", 400, lambda: client.get("/kv/UPPER")),
         ("/kv/{ns}/{key}", "get", 400, lambda: client.get("/kv/UPPER/key")),
         ("/kv/{ns}/{key}", "get", 404, lambda: client.get("/kv/plans/never-written")),

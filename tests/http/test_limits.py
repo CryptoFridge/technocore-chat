@@ -505,12 +505,21 @@ def test_a_budget_warning_never_reaches_the_json_lane(client, monkeypatch):
         assert "# budget:" in client.post("/r/lobby", json={"from": "a", "text": "y"}).text
 
 
-def test_limit_is_clamped_to_the_response_budget(client):
+def test_limit_is_validated_or_clamped(client):
+    """Issue #372/402: out-of-range limits are rejected, non-numeric defaults, floor of 1."""
+    import store
+
     for _ in range(3):
         client.get("/r/lobby/say/bot/hi")
-    assert client.get("/r/lobby?limit=999&format=json").json()["count"] == 3
-    assert client.get("/r/lobby?limit=0&format=json").json()["count"] == 1  # floor of 1
-    assert client.get("/r/lobby?limit=abc&format=json").json()["count"] == 3  # default
+    # Out-of-range above MAX_LIMIT is rejected with 400
+    r = client.get(f"/r/lobby?limit={store.MAX_LIMIT + 1}")
+    assert r.status_code == 400
+    # limit=0 is below minimum (schema says minimum 1), rejected
+    assert client.get("/r/lobby?limit=0&format=json").status_code == 400
+    # Non-numeric defaults to 50
+    assert client.get("/r/lobby?limit=abc&format=json").json()["count"] == 3
+    # Valid high limit works
+    assert client.get("/r/lobby?limit=200&format=json").json()["count"] == 3
 
 
 def test_cursor_past_the_end_returns_an_empty_but_usable_view(client):
@@ -592,7 +601,7 @@ def test_malformed_payload_shapes_are_400_not_500(client):
         )
         assert r.status_code == 400, body
     assert client.post("/r/lobby", content=b"{not json").status_code == 400
-    assert client.post("/r/lobby", json={}).status_code == 400  # empty from/text
+    assert client.post("/r/lobby", json={}).status_code == 422  # missing from
 
 
 def test_a_malformed_note_post_names_the_note_shape_to_send_next(client):
@@ -616,11 +625,13 @@ def test_numeric_inputs_cannot_overflow_or_amplify(client, tmp_path):
     assert app_module._cursor("9" * 100_000, 50) == 50
     assert app_module._cursor("9" * 4000, 50) == int("9" * 4000)
     assert client.get("/r/lobby?since=" + "9" * 5000).status_code == 200
+    # A 5000-digit string exceeds Python's int conversion limit (4300),
+    # so _cursor falls back to default 50, which is valid
     assert client.get("/r/lobby?limit=" + "9" * 5000).status_code == 200
     assert client.get(f"/r/lobby?since={2**70}&format=json").json()["count"] == 0
     # /rooms detail is clamped, so one cheap request cannot force unbounded tail reads
     assert len(store.room_stats(tmp_path, limit=10**9)["rooms"]) <= store.MAX_LIMIT
-    assert client.get("/rooms?limit=999999999&format=json").status_code == 200
+    assert client.get("/rooms?limit=999999999&format=json").status_code == 400  # exceeds MAX_LIMIT
 
 
 def test_header_block_is_capped_far_below_the_edge_ceiling(client):

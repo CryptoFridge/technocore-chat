@@ -247,6 +247,39 @@ def _json_doc(description: str, media_type: str = "application/json") -> dict:
     }
 
 
+def _json_error(description: str) -> dict:
+    """A JSON error response with an `error` field describing what went wrong."""
+    return {
+        "description": description,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "properties": {"error": {"type": "string"}},
+                    "required": ["error"],
+                }
+            }
+        },
+    }
+
+
+def _bad_name_or_json(description: str) -> dict:
+    """400 that can be text/plain (bad name) or application/json (bad query param)."""
+    return {
+        "description": description,
+        "content": {
+            "text/plain": {"schema": {"type": "string"}},
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "properties": {"error": {"type": "string"}},
+                    "required": ["error"],
+                }
+            },
+        },
+    }
+
+
 def _text_or_json(description: str, schema: dict) -> dict:
     """Every read route answers text/plain by default and JSON on `?format=json`."""
     return {
@@ -445,7 +478,9 @@ def openapi_document(base: str, version: str, max_body_bytes: int, max_wait: flo
                     ],
                     "responses": {
                         "200": _text_or_json("The requested slice of the room.", _ROOM_VIEW_SCHEMA),
-                        "400": _BAD_NAME,
+                        "400": _bad_name_or_json(
+                            "Malformed room name, or invalid query parameter (limit must be 1..{max_limit}, format must be 'json' or omitted)."
+                        ),
                         "429": _RATE_LIMITED,
                     },
                 },
@@ -472,7 +507,7 @@ def openapi_document(base: str, version: str, max_body_bytes: int, max_wait: flo
                         "413": _plain(
                             f"Body over {max_body_bytes // 1024} KiB. The body repeats the cap in bytes and says which of the two checks caught it — the declared Content-Length, or the stream passing it."
                         ),
-                        "422": _DUPLICATE_TEXT,
+                        "422": _json_error("Missing or empty `from` field for unsigned writes."),
                         "429": _RATE_LIMITED,
                     },
                 },
@@ -676,6 +711,10 @@ def openapi_document(base: str, version: str, max_body_bytes: int, max_wait: flo
                                     },
                                 },
                             },
+                        ),
+                        "400": _json_error(
+                            "Invalid query parameter: limit must be 1..{max_limit}, "
+                            "format must be 'json' or omitted."
                         ),
                         "429": _RATE_LIMITED,
                     },

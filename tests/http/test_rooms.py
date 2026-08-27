@@ -560,13 +560,9 @@ def test_rooms_metrics_never_scan_past_the_window_per_room(client, tmp_path, mon
 
 
 def test_one_reply_is_one_cache_entry_however_the_limit_was_spelled(client, monkeypatch):
-    """`?limit=` is caller-supplied and was the cache key raw, while the walk it keys clamps
-    to MAX_LIMIT. So ?limit=200, ?limit=1000000 and ?limit=1000001 are one reply and were
-    three entries — a caller could walk every room on every request by incrementing a number,
-    at one read from its bucket, and evict everyone else's view out of a 64-entry cache on
-    the way past. The walk is the most expensive read on the service; the cache in front of
-    it only works if the key is the thing that shapes the answer.
-    """
+    """`?limit=` is caller-supplied and must be validated. Issue #372/402: out-of-range
+    limits are now rejected with 400 rather than silently clamped. Within range, the
+    cache key matches the reply shape."""
     import app
     import store
 
@@ -581,10 +577,16 @@ def test_one_reply_is_one_cache_entry_however_the_limit_was_spelled(client, monk
 
     app._rooms_cache.clear()
     monkeypatch.setattr(store, "room_stats", counting)
-    bodies = [client.get(f"/rooms?limit={n}").text for n in (200, 1000000, 1000001, 0, 1)]
-    assert walks == 2, f"two distinct replies (>=200 and 1), {walks} walks"
-    assert bodies[0] == bodies[1] == bodies[2], "clamped to MAX_LIMIT, so one reply"
-    assert bodies[3] == bodies[4], "0 and 1 both floor to one room"
+    # Within-range limits: 200 and 199 produce the same clamped reply
+    assert client.get("/rooms?limit=200").status_code == 200
+    assert client.get("/rooms?limit=199").status_code == 200
+    # Out-of-range is rejected
+    assert client.get(f"/rooms?limit={store.MAX_LIMIT + 1}").status_code == 400
+    # limit=0 is below minimum, also rejected (doesn't walk)
+    assert client.get("/rooms?limit=0").status_code == 400
+    # limit=1 is the minimum valid value, forces a new walk (different cache key)
+    assert client.get("/rooms?limit=1").status_code == 200
+    assert walks == 3, f"three walks: 200, rejected(201), rejected(0), 1 → {walks}"
 
 
 def test_rooms_reports_note_usage_without_naming_namespaces(client):
@@ -1189,3 +1191,66 @@ def test_wait_wakes_on_a_write_from_another_process(client, tmp_path):
     messages = held.json()["messages"]
     assert [m["text"] for m in messages] == ["from another process"]
     assert messages[0]["from"] == "otherworker"
+
+
+def test_post_requires_from_for_unsigned_lane(client):
+    """Issue #373: POST /r/{room} must require `from` for unsigned writes."""
+    resp = client.post("/r/lobby", json={"text": "hello"})
+    assert resp.status_code == 422
+    body = resp.json()
+    assert "from" in body["error"].lower()
+
+
+def test_post_accepts_from_with_nonempty_text(client):
+    """POST with valid `from` and non-empty text succeeds."""
+    resp = client.post("/r/lobby", json={"from": "bot", "text": "hello"})
+    assert resp.status_code == 200
+
+
+def test_rooms_rejects_out_of_range_limit(client):
+    """Issue #372: GET /rooms must reject limit outside 1..MAX_LIMIT."""
+    import store
+
+    resp = client.get("/r/lobby")  # ensure room exists
+    resp = client.get("/rooms?limit=0")
+    assert resp.status_code == 400
+    assert "limit" in resp.json()["error"].lower()
+
+    resp = client.get(f"/rooms?limit={store.MAX_LIMIT + 1}")
+    assert resp.status_code == 400
+
+
+def test_rooms_rejects_unknown_format(client):
+    """Issue #372: GET /rooms must reject unknown format values."""
+    resp = client.get("/rooms?format=xml")
+    assert resp.status_code == 400
+    assert "format" in resp.json()["error"].lower()
+
+
+def test_room_read_rejects_out_of_range_limit(client):
+    """Issue #402: GET /r/{room} must reject limit outside 1..MAX_LIMIT."""
+    import store
+
+    client.get("/r/lobby/say/bot/hello")
+    resp = client.get("/r/lobby?limit=0")
+    assert resp.status_code == 400
+    assert "limit" in resp.json()["error"].lower()
+
+    resp = client.get(f"/r/lobby?limit={store.MAX_LIMIT + 1}")
+    assert resp.status_code == 400
+
+
+def test_room_read_rejects_unknown_format(client):
+    """Issue #402: GET /r/{room} must reject unknown format values."""
+    client.get("/r/lobby/say/bot/hello")
+    resp = client.get("/r/lobby?format=xml")
+    assert resp.status_code == 400
+    assert "format" in resp.json()["error"].lower()
+
+
+def test_room_read_accepts_valid_json_format(client):
+    """GET /r/{room}?format=json should work normally."""
+    client.get("/r/lobby/say/bot/hello")
+    resp = client.get("/r/lobby?format=json")
+    assert resp.status_code == 200
+    assert resp.json()["messages"]

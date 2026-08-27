@@ -787,7 +787,21 @@ def rooms(request: Request) -> Response:
     # key: ?limit=200 and ?limit=1000000 are one reply and were two entries, so a caller
     # incrementing it walked every room on every request and evicted everyone else's view
     # out of a 64-entry cache while doing it. Now the key space is the reply space.
-    view = _rooms_view(min(_cursor(q.get("limit"), 50) or 1, store.MAX_LIMIT))
+    raw_limit = _cursor(q.get("limit"), 50)
+    if raw_limit is not None and (raw_limit < 1 or raw_limit > store.MAX_LIMIT):
+        return text(
+            json.dumps({"error": f"limit must be 1..{store.MAX_LIMIT}"}),
+            400,
+            media_type="application/json",
+        )
+    fmt = q.get("format")
+    if fmt is not None and fmt != "json":
+        return text(
+            json.dumps({"error": "format must be 'json' or omitted"}),
+            400,
+            media_type="application/json",
+        )
+    view = _rooms_view(min(raw_limit or 1, store.MAX_LIMIT))
     n = view["notes"]
     # Both note caps, for the reason the room head prints both of its own: either can be the
     # one that refuses the next write, and the per-namespace figure moves per deployment.
@@ -875,9 +889,25 @@ async def room_read(request: Request) -> Response:
         return limit.limited("read", RATE_READ, retry, text=text, max_wait=MAX_WAIT)
     q = request.query_params
     since = _cursor(q.get("since"), None)
+    # Validate limit: reject out-of-range values
+    raw_limit = _cursor(q.get("limit"), 50)
+    if raw_limit is not None and (raw_limit < 1 or raw_limit > store.MAX_LIMIT):
+        return text(
+            json.dumps({"error": f"limit must be 1..{store.MAX_LIMIT}"}),
+            400,
+            media_type="application/json",
+        )
+    # Validate format: only "json" is recognized
+    fmt = q.get("format")
+    if fmt is not None and fmt != "json":
+        return text(
+            json.dumps({"error": "format must be 'json' or omitted"}),
+            400,
+            media_type="application/json",
+        )
     # `tail`, not `limit`: the query param keeps its published name, the local must not
     # shadow the limit module the refusal two lines above calls into.
-    tail = _cursor(q.get("limit"), 50)
+    tail = raw_limit
     room = request.path_params["room"]
     # Tail reads are blocking file IO. This route is async for the waiting half, so the
     # read has to go to a thread explicitly — as a sync route Starlette did that for us.
@@ -1261,7 +1291,14 @@ async def room_post(request: Request) -> Response:
         if denied:
             return denied
         if signer is None:
-            nick, sent = str(payload.get("from", "")), str(payload.get("text", ""))
+            nick = str(payload.get("from", "")).strip()
+            if not nick:
+                return text(
+                    json.dumps({"error": "from is required for unsigned writes"}),
+                    422,
+                    media_type="application/json",
+                )
+            sent = str(payload.get("text", ""))
             with _dupe_slot(room, sent) as refused:
                 if refused:
                     return _dupe_refusal(request, room)
