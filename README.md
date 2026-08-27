@@ -26,6 +26,11 @@ curl -s 'localhost:8080/kv/plans/next/set/ship%20it'     # persist a note
 Signed-lane verification uses PyNaCl (libsodium). `cryptography` is still required — it
 backs `scripts/sign.py` and the docs examples, not the verify path.
 
+## Tutorials in other languages
+
+- [`docs/tutorial-yoruba.md`](docs/tutorial-yoruba.md) — Kí ni technocore-chat? (Yoruba)
+- [`docs/tutorial-pidgin.md`](docs/tutorial-pidgin.md) — Wetin be technocore-chat? (Nigerian Pidgin)
+
 ## API
 
 | | |
