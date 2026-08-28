@@ -206,36 +206,98 @@ def test_concurrent_writers_never_corrupt_the_ring() -> None:
     limit._dupes.clear()
 
 
-def test_refused_dupe_stays_in_lru_ring_under_eviction():
-    """Issue #358: a refused duplicate must not be the first entry evicted by the hard cap.
-    Before the fix, the refusal branch returned early without calling move_to_end, leaving
-    the refused key at the front of the LRU where cap eviction drops it first."""
-    import limit
+def test_eviction_does_not_hand_a_refused_text_a_fresh_copy_budget() -> None:
+    """Issue #358: a refused text must not become acceptable again because the ring
+    churned.  move_to_end only protects a key touched *during* the churn, so the fix
+    is that a phrase which keeps being attempted keeps its slot.  The phrase is
+    re-attempted after every filler and the assertion counts the attempts that came
+    back accepted: each one is a copy the filter had already refused, handed back
+    because the key was evicted and the next copy was recorded as a first copy.
 
+    Fillers are long enough to be keyed (>= min_length).  Below the floor
+    _dupe_key returns None and none of them enter the ring.
+
+    Test body courtesy of Orvynel (GitHub review on #416).
+    """
     limit._dupes.clear()
-    room, phrase = "lobby", "buy the token now, huge gains guaranteed, dont miss out"
-    t = 0.0
-    # Accept the first 5 copies
-    for _ in range(5):
-        assert (
-            limit.dupe_refused(room, phrase, t, window=1000, min_length=16, max_copies=5, cap=64)
-            is False
+    cap, now, handed_back = 64, 0.0, 0
+    for _ in range(COPIES):
+        assert refused(LONG, now=now, window=1000, cap=cap) is False
+        now += 1.0
+    for i in range(2 * cap):
+        refused(
+            "a filler phrase long enough to be keyed " + str(i),
+            now=now,
+            window=1000,
+            cap=cap,
         )
-        t += 1.0
-    # Then keep it refused, well inside the window
-    for _ in range(20):
-        assert (
-            limit.dupe_refused(room, phrase, t, window=1000, min_length=16, max_copies=5, cap=64)
-            is True
-        )
-        t += 1.0
-    # Fill the ring with unrelated traffic
-    for i in range(64):
-        limit.dupe_refused(room, f"filler {i}", t, window=1000, min_length=16, max_copies=5, cap=64)
-        t += 1.0
-    # Still well inside the window, still the exact phrase — should still be refused
-    assert (
-        limit.dupe_refused(room, phrase, t, window=1000, min_length=16, max_copies=5, cap=64)
-        is True
+        now += 1.0
+        handed_back += refused(LONG, now=now, window=1000, cap=cap) is False
+        now += 1.0
+    assert handed_back == 0, (
+        f"a refused text was accepted again {handed_back} times inside the window: cap "
+        "eviction dropped its key and the next copy was recorded as a first copy"
+    )
+    assert len(limit._dupes) <= cap, "the bound still has to hold"
+    limit._dupes.clear()
+
+
+def test_a_refusal_keeps_the_key_from_being_evicted_early() -> None:
+    """Issue #358 / PR #367: a refusal that is touched during cap eviction churn must
+    survive.  The fillers and the re-assertion are interleaved so the phrase key is
+    moved_to_end *during* the churn, not before it.
+
+    Test body courtesy of teyrebaz33 (PR #367).
+    """
+    limit._dupes.clear()
+    cap = 64
+    # Use values consistent with the file's own constants.
+    for _ in range(COPIES):
+        assert refused(LONG, now=0.0, window=1000, cap=cap) is False
+    # Interleave: filler flood + re-assertion of the same phrase.
+    for i in range(2 * cap):
+        refused("filler phrase long enough for the key " + str(i), now=0.0, window=1000, cap=cap)
+        assert refused(LONG, now=0.0, window=1000, cap=cap) is True
+    limit._dupes.clear()
+
+
+def test_a_refusal_also_pays_into_the_sweep() -> None:
+    """Issue #358 / PR #367: on main, a refusal returned before the sweep as well as
+    before move_to_end, so during a sustained refused flood the ring stopped paying
+    into maintenance entirely and expired keys lingered.  After the fix the sweep
+    runs on every call.
+
+    Uses a single window throughout so the sweep's expiry check is consistent.
+    Expired keys are added at t=0 with text long enough to pass the floor; LONG is
+    pre-filled at t just inside the window so it survives the sweep during the accept
+    phase; the flood runs well past the window so the sweep deletes the expired keys
+    on the refusal branch.
+
+    Test body adapted from teyrebaz33 (PR #367).
+    """
+    limit._dupes.clear()
+    cap, window = 64, 1000.0
+    # Texts must be >= min_length (FLOOR=16) to enter the ring.
+    expired_phrase = "this phrase will expire and be swept away"
+    assert len(limit.normalize_text(expired_phrase)) >= FLOOR
+    # Plant 5 keys at t=0 that will be expired by the flood time.
+    for i in range(5):
+        refused(f"{expired_phrase} {i}", now=0.0, window=window, cap=cap)
+    assert len(limit._dupes) == 5, "all 5 must have entered the ring"
+    # Pre-fill LONG at t = window/2 (inside window, so expired keys survive the
+    # sweep that runs during these accepts).
+    mid_t = window / 2
+    for _i in range(COPIES):
+        refused(LONG, now=mid_t, window=window, cap=cap)
+    assert len(limit._dupes) == 6, "5 expired + LONG"
+    # Flood with refusals at t = window+1 (expired keys are now expired, LONG is
+    # not because mid_t = window/2 and flood_t - mid_t = window/2+1 < window).
+    flood_t = window + 1
+    for i in range(100):
+        refused(LONG, now=flood_t + i, window=window, cap=cap)
+    # On patched: sweep deleted the 5 expired keys.  On unpatched: they linger.
+    assert len(limit._dupes) == 1, (
+        f"expected 1 key (LONG) after sweep, got {len(limit._dupes)}: "
+        "the sweep must run on the refusal branch"
     )
     limit._dupes.clear()
